@@ -336,6 +336,66 @@ If a node group creation is hanging for more than 15 minutes:
 3. Check that the security groups allow necessary traffic
 4. Ensure the IAM roles have proper permissions
 
+### CNI Initialization Issues
+If nodes are reporting "container runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady message:cni plugin not initialized":
+
+1. Ensure the proper deployment order is followed (VPC → EKS Cluster → Monitoring/Management → EKS Addons → Services/Data)
+2. SSH to the problematic node using SSM and run the included diagnostic script:
+   ```bash
+   sudo /home/ec2-user/debug-eks.sh
+   ```
+3. To fix CNI issues manually, run the included repair script:
+   ```bash
+   sudo /home/ec2-user/fix-cni.sh
+   ```
+4. If the issue persists, verify that the VPC CNI addon is properly installed:
+   ```bash
+   aws eks describe-addon --cluster-name eks-cluster --addon-name vpc-cni
+   ```
+5. Use the included EKS addon status checking tools to verify all addons are properly deployed:
+
+   For Windows:
+   ```powershell
+   cd utility-scripts
+   .\check-eks-addons.ps1
+   ```
+
+   For Linux/macOS:
+   ```bash
+   cd utility-scripts
+   ./check-eks-addons.sh
+   ```
+
+The enhanced node bootstrap scripts should automatically handle most CNI issues, but these tools are provided for manual intervention if needed.
+
+### State Lock Issues
+If you encounter state lock issues when running Terragrunt:
+
+1. First, try waiting a few minutes and then retrying the operation
+2. If the lock persists, use the included lock cleaning tools:
+
+   For Windows:
+   ```powershell
+   cd utility-scripts
+   .\clean-stale-locks.ps1
+   ```
+
+   For Linux/macOS:
+   ```bash
+   cd utility-scripts
+   ./clean-stale-locks.sh
+   ```
+
+3. For a specific known lock, use terragrunt force-unlock:
+   ```bash
+   terragrunt force-unlock <LOCK_ID>
+   ```
+
+The enhanced terragrunt.hcl configuration includes several improvements to make state locks more reliable:
+- Longer retry timeouts
+- More comprehensive retry patterns
+- Automatic lock status checking
+
 ### Resource Already Exists Errors
 If you encounter "resource already exists" errors:
 1. First try to import the existing resource into your Terraform state

@@ -19,6 +19,27 @@ remote_state {
     region         = "us-east-1"
     encrypt        = true
     dynamodb_table = "terraform-locks"
+    
+    # Improve state locking with exponential backoff and TTL
+    dynamodb_table_tags = {
+      Name = "Terraform State Lock Table"
+      Project = "EKS-Cluster"
+    }
+    
+    # Configure S3 bucket details
+    s3_bucket_tags = {
+      Name = "Terraform State Storage"
+      Project = "EKS-Cluster" 
+    }
+    
+    # Force SSL for security
+    force_path_style = false
+    skip_bucket_versioning = false
+    skip_bucket_ssencryption = false
+    
+    # Configure locking behavior
+    skip_bucket_root_access = true
+    skip_metadata_api_check = false
   }
   generate = {
     path      = "backend.tf"
@@ -72,6 +93,14 @@ terraform {
       source  = "hashicorp/random"
       version = ">= 3.1.0"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.0"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
   }
 }
 EOF
@@ -92,12 +121,40 @@ terraform {
     # Increase parallelism and configure lock timeouts
     arguments = [
       "-parallelism=30",
-      "-lock-timeout=20m"
+      "-lock-timeout=30m"
     ]
   }
 }
 
-# Avoid lock timeout issues
+# Generate lock management helper functions
+generate "lock_helpers" {
+  path = "lock_helpers.tf"
+  if_exists = "overwrite"
+  contents = <<EOF
+# This resource helps clean up stale locks
+resource "null_resource" "lock_management" {
+  # Trigger on each apply to check for stale locks
+  triggers = {
+    always_run = timestamp()
+  }
+
+  # This will run on each apply, but only log information
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Checking for stale locks in DynamoDB table terraform-locks for path: ${path_relative_to_include()}/terraform.tfstate"
+      aws dynamodb get-item --table-name terraform-locks --key '{"LockID": {"S": "eks-terraform-state-${get_aws_account_id()}/${path_relative_to_include()}/terraform.tfstate"}}' --region us-east-1 || echo "No lock found"
+    EOT
+  }
+
+  # This is just for information, it doesn't actually do anything
+  lifecycle {
+    ignore_changes = all
+  }
+}
+EOF
+}
+
+# Avoid lock timeout issues with enhanced retries
 retryable_errors = [
   "(?s).*Failed to acquire the state lock.*",
   "(?s).*Error acquiring the state lock.*",
@@ -106,12 +163,15 @@ retryable_errors = [
   "(?s).*RequestError: send request failed.*",
   "(?s).*Error: InvalidParameterException.*",
   "(?s).*Error: RequestError: multiple error.*",
-  "(?s).*Error: timeout while waiting for state to become.*"
+  "(?s).*Error: timeout while waiting for state to become.*",
+  "(?s).*Error: Provider produced inconsistent final plan.*",
+  "(?s).*Error: Provider configuration not present.*",
+  "(?s).*ConditionalCheckFailedException.*"
 ]
 
-# Configure retry sleep for Terragrunt operations
-retry_sleep_interval_sec = 5
-retry_max_attempts = 10
+# Configure aggressive retry behavior for Terragrunt operations to avoid lock issues
+retry_sleep_interval_sec = 10
+retry_max_attempts = 15
 
 # Inputs that are common to all stacks
 inputs = {

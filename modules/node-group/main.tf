@@ -28,7 +28,7 @@ Content-Type: multipart/mixed; boundary="==BOUNDARY=="
 Content-Type: text/x-shellscript; charset="us-ascii"
 
 #!/bin/bash
-# EKS Node bootstrap script with extensive CNI handling and diagnostics
+# EKS Node bootstrap script with enhanced CNI handling and diagnostics
 # ==========================================================================
 
 # Enable maximum debugging
@@ -43,8 +43,8 @@ echo "Cluster: ${var.cluster_name}"
 # Create debugging directory
 mkdir -p /var/log/eks-debug
 
-# Install jq and curl if they're not already installed
-yum install -y jq curl aws-cli
+# Install required utilities
+yum install -y jq curl aws-cli bind-utils
 
 # Save critical information to debug files
 echo "${var.cluster_name}" > /var/log/eks-debug/cluster-name.txt
@@ -62,18 +62,41 @@ echo "Instance ID: $$INSTANCE_ID"
 echo "Region: $$REGION"
 echo "Availability Zone: $$AVAILABILITY_ZONE"
 
-# Get cluster VPC CNI addon status from AWS API
-echo "Checking VPC CNI addon status from AWS API..."
-VPC_CNI_STATUS=$(aws eks describe-addon --cluster-name ${var.cluster_name} --addon-name vpc-cni --region $$REGION --query 'addon.status' --output text 2>/dev/null || echo "UNKNOWN")
-echo "VPC CNI addon status: $$VPC_CNI_STATUS"
-
 # Pre-create CNI directories to avoid race conditions
 mkdir -p /etc/cni/net.d
 mkdir -p /opt/cni/bin
+mkdir -p /var/log/aws-routed-eni
+mkdir -p /var/run/aws-node
 
-# If addon is not active, pre-create a minimal CNI config to avoid blocking kubelet
-if [ "$$VPC_CNI_STATUS" != "ACTIVE" ]; then
-  echo "VPC CNI addon not active, creating temporary CNI configuration..."
+# Function to check VPC CNI status with retries
+check_vpc_cni_status() {
+  local retries=10
+  local wait_time=10
+  local attempt=1
+  local status="UNKNOWN"
+
+  echo "Checking VPC CNI addon status from AWS API..."
+  
+  while [ $$attempt -le $$retries ]; do
+    echo "Attempt $$attempt of $$retries to check VPC CNI status..."
+    status=$(aws eks describe-addon --cluster-name ${var.cluster_name} --addon-name vpc-cni --region $$REGION --query 'addon.status' --output text 2>/dev/null || echo "UNKNOWN")
+    echo "VPC CNI addon status: $$status"
+    
+    if [ "$$status" = "ACTIVE" ]; then
+      return 0
+    fi
+    
+    echo "Waiting $$wait_time seconds before next attempt..."
+    sleep $$wait_time
+    attempt=$((attempt+1))
+  done
+  
+  return 1
+}
+
+# Download and create temporary CNI configuration if needed
+create_temp_cni_config() {
+  echo "Creating temporary CNI configuration to bootstrap networking..."
   cat > /etc/cni/net.d/10-aws.conflist << 'EOF'
 {
   "cniVersion": "0.4.0",
@@ -95,47 +118,109 @@ if [ "$$VPC_CNI_STATUS" != "ACTIVE" ]; then
   ]
 }
 EOF
-fi
 
-# Check for CNI binary installation
-echo "Checking for CNI binaries..."
-if [ ! -f "/opt/cni/bin/aws-cni" ]; then
-  echo "CNI binaries not found, creating placeholder binaries..."
-  touch /opt/cni/bin/aws-cni
-  touch /opt/cni/bin/egress-cni
-  chmod +x /opt/cni/bin/aws-cni
-  chmod +x /opt/cni/bin/egress-cni
-fi
+  # Create placeholder binaries if needed
+  if [ ! -f "/opt/cni/bin/aws-cni" ]; then
+    echo "Creating placeholder CNI binaries..."
+    cat > /opt/cni/bin/aws-cni << 'EOF'
+#!/bin/sh
+echo "Placeholder aws-cni binary"
+exit 0
+EOF
 
-# Check for CNI configuration and wait if it's not present
-echo "Checking for CNI configuration..."
-CNI_CONFIG_RETRIES=30
-CNI_CONFIG_RETRY_INTERVAL=10
-CNI_CONFIG_FOUND=false
+    cat > /opt/cni/bin/egress-cni << 'EOF'
+#!/bin/sh
+echo "Placeholder egress-cni binary"
+exit 0
+EOF
 
-for ((i=1; i<=CNI_CONFIG_RETRIES; i++)); do
-  if [ -d /etc/cni/net.d ] && [ -n "$(ls -A /etc/cni/net.d 2>/dev/null)" ]; then
-    CNI_CONFIG_FOUND=true
-    echo "CNI configuration found on attempt $$i"
-    ls -la /etc/cni/net.d
-    cat /etc/cni/net.d/*
-    break
-  else
-    echo "Attempt $$i: CNI configuration not found, waiting $$CNI_CONFIG_RETRY_INTERVAL seconds..."
-    sleep $$CNI_CONFIG_RETRY_INTERVAL
+    chmod +x /opt/cni/bin/aws-cni
+    chmod +x /opt/cni/bin/egress-cni
   fi
-done
+}
 
-# Create directories needed by aws-node
-mkdir -p /var/log/aws-routed-eni
-mkdir -p /var/run/aws-node
+# Function to wait for CNI configuration with enhanced retries
+wait_for_cni_config() {
+  local retries=30
+  local wait_time=10
+  local attempt=1
+  
+  echo "Waiting for CNI configuration to be available..."
+  
+  while [ $$attempt -le $$retries ]; do
+    echo "Attempt $$attempt of $$retries to check for CNI configuration..."
+    
+    if [ -d /etc/cni/net.d ] && [ -n "$(ls -A /etc/cni/net.d 2>/dev/null)" ]; then
+      echo "CNI configuration found:"
+      ls -la /etc/cni/net.d
+      cat /etc/cni/net.d/*
+      return 0
+    fi
+    
+    echo "CNI configuration not found, waiting $$wait_time seconds..."
+    sleep $$wait_time
+    attempt=$((attempt+1))
+  done
+  
+  echo "CNI configuration not found after $$retries attempts. Creating temporary configuration..."
+  create_temp_cni_config
+  return 1
+}
+
+# Function to manually download and install AWS CNI if needed
+install_aws_cni() {
+  echo "Manually downloading and installing AWS CNI..."
+  
+  # Create temp directory
+  mkdir -p /tmp/aws-cni
+  cd /tmp/aws-cni
+  
+  # Download latest AWS CNI
+  curl -Lo aws-k8s-cni.yaml https://raw.githubusercontent.com/aws/amazon-vpc-cni-k8s/master/config/master/aws-k8s-cni.yaml
+  
+  # Extract binary locations from the YAML
+  CNI_IMAGE=$(grep -A 2 "image:" aws-k8s-cni.yaml | grep "amazon-k8s-cni" | head -1 | awk '{print $2}')
+  
+  if [ -n "$$CNI_IMAGE" ]; then
+    echo "Found CNI image: $$CNI_IMAGE"
+    
+    # Pull the image
+    docker pull $$CNI_IMAGE || echo "Could not pull CNI image"
+    
+    # Extract binaries from image if docker is available
+    if command -v docker > /dev/null; then
+      echo "Extracting CNI binaries from docker image..."
+      docker create --name aws-cni-temp $$CNI_IMAGE
+      docker cp aws-cni-temp:/app/aws-cni /opt/cni/bin/
+      docker cp aws-cni-temp:/app/egress-cni /opt/cni/bin/
+      docker rm aws-cni-temp
+      chmod +x /opt/cni/bin/aws-cni
+      chmod +x /opt/cni/bin/egress-cni
+    fi
+  else
+    echo "Could not find CNI image in yaml file"
+  fi
+}
+
+# Check VPC CNI status and create temporary config if not active
+if ! check_vpc_cni_status; then
+  echo "VPC CNI addon not active or not reachable, creating temporary CNI setup..."
+  create_temp_cni_config
+  install_aws_cni
+fi
+
+# Wait for proper CNI configuration
+wait_for_cni_config
 
 # Run network diagnostics
 echo "Testing network connectivity..."
+
+# Test DNS resolution
 echo "Testing DNS resolution..."
 echo "CoreDNS service default IP (10.100.0.10):"
 dig +short 10.100.0.10 || echo "DNS lookup for 10.100.0.10 failed"
 
+# Test API server connectivity
 echo "API Server connectivity:"
 API_SERVER="$${var.cluster_endpoint#https://}"
 echo "API server DNS lookup result:"
@@ -150,8 +235,6 @@ echo "Trying to detect correct EKS service CIDR..."
 for SERVICE_CIDR in "10.100.0.0/16" "172.20.0.0/16"; do
   DNS_IP="$${SERVICE_CIDR%.*.*}.0.10"
   echo "Testing DNS_IP=$$DNS_IP (from $$SERVICE_CIDR)"
-  
-  # Log both options but default to 10.100.0.10
   echo $$DNS_IP > /var/log/eks-debug/dns-ip-$$DNS_IP.txt
 done
 
@@ -166,7 +249,7 @@ ip route show
 
 # Check kubelet version
 echo "Checking kubelet version:"
-kubelet --version
+kubelet --version || echo "Kubelet not available yet"
 
 # Prepare bootstrap kubelet config to avoid CNI dependency during bootstrap
 echo "Creating temporary kubelet systemd drop-in to avoid CNI issues..."
@@ -175,6 +258,9 @@ cat > /etc/systemd/system/kubelet.service.d/10-pre-cni-bootstrap.conf << 'EOF'
 [Service]
 Environment="KUBELET_EXTRA_ARGS=--network-plugin=kubenet --cni-conf-dir=/etc/cni/net.d --cni-bin-dir=/opt/cni/bin"
 EOF
+
+# Reload systemd to apply the drop-in
+systemctl daemon-reload
 
 # Try to run the bootstrap script
 echo "==== Running EKS bootstrap script ===="
@@ -193,14 +279,14 @@ echo "Bootstrap script exit code: $$BOOTSTRAP_EXIT_CODE"
 # Save kubelet configuration and logs regardless of bootstrap success
 echo "==== Kubelet Configuration and Logs ===="
 mkdir -p /var/log/eks-debug/kubelet
-cp -r /var/lib/kubelet/* /var/log/eks-debug/kubelet/ || echo "Couldn't copy kubelet config"
+cp -r /var/lib/kubelet/* /var/log/eks-debug/kubelet/ 2>/dev/null || echo "Couldn't copy kubelet config"
 
 # Gather logs
 echo "==== Saving system logs ===="
-journalctl -u kubelet -n 200 > /var/log/eks-debug/kubelet-journal.log
+journalctl -u kubelet -n 200 > /var/log/eks-debug/kubelet-journal.log 2>/dev/null || echo "No kubelet journal logs yet"
 dmesg > /var/log/eks-debug/dmesg.log
-cp /var/log/messages /var/log/eks-debug/messages.log
-cp /var/log/cloud-init* /var/log/eks-debug/
+cp /var/log/messages /var/log/eks-debug/messages.log 2>/dev/null || echo "No messages log file"
+cp /var/log/cloud-init* /var/log/eks-debug/ 2>/dev/null || echo "No cloud-init logs"
 
 # Remove the temporary kubelet config now that bootstrap is complete
 echo "Removing temporary kubelet overrides..."
@@ -212,8 +298,33 @@ if ! systemctl is-active kubelet; then
   echo "Kubelet not running, attempting to start it..."
   systemctl start kubelet
   sleep 5
-  systemctl status kubelet > /var/log/eks-debug/kubelet-status.log
+  systemctl status kubelet > /var/log/eks-debug/kubelet-status.log 2>&1 || echo "Kubelet status check failed"
 fi
+
+# Create fix-cni script to help with troubleshooting
+cat > /home/ec2-user/fix-cni.sh << 'EOF'
+#!/bin/bash
+set -x
+
+echo "Checking AWS VPC CNI addon status..."
+aws eks describe-addon --cluster-name $(cat /var/log/eks-debug/cluster-name.txt) --addon-name vpc-cni --region $(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+
+echo "Checking CNI pods..."
+kubectl get pods -n kube-system -l k8s-app=aws-node
+
+echo "Showing CNI configuration..."
+ls -la /etc/cni/net.d/
+cat /etc/cni/net.d/*
+
+echo "Restarting kubelet..."
+systemctl restart kubelet
+
+echo "Checking CNI logs..."
+kubectl logs -n kube-system -l k8s-app=aws-node --tail=20
+
+echo "CNI fix completed"
+EOF
+chmod +x /home/ec2-user/fix-cni.sh
 
 # Create a file with debugging commands for easier troubleshooting via SSM
 cat > /home/ec2-user/debug-eks.sh << 'EOF'
@@ -234,6 +345,7 @@ echo ""
 echo "11. Check AWS VPC CNI addon status:  aws eks describe-addon --cluster-name \$(cat /var/log/eks-debug/cluster-name.txt) --addon-name vpc-cni --region \$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)"
 echo "12. Check node logs in AWS CNI:      kubectl logs -n kube-system -l k8s-app=aws-node --tail=50"
 echo "13. Restart kubelet:                 sudo systemctl restart kubelet"
+echo "14. Fix CNI issues:                  sudo /home/ec2-user/fix-cni.sh"
 echo ""
 EOF
 chmod +x /home/ec2-user/debug-eks.sh
@@ -245,6 +357,7 @@ chmod 644 /var/log/eks-bootstrap.log
 echo "=========== Bootstrap process completed ==========="
 echo "Debug logs available at /var/log/eks-bootstrap.log and /var/log/eks-debug/"
 echo "Run /home/ec2-user/debug-eks.sh for troubleshooting help"
+echo "Run /home/ec2-user/fix-cni.sh to fix CNI issues"
 
 # Keep kubelet running even if bootstrap failed
 if [ $$BOOTSTRAP_EXIT_CODE -ne 0 ]; then
@@ -252,7 +365,13 @@ if [ $$BOOTSTRAP_EXIT_CODE -ne 0 ]; then
   systemctl restart kubelet
 fi
 
-# End of script
+# Final check to ensure the node is properly configured for CNI
+echo "Performing final CNI check..."
+if [ ! -f /etc/cni/net.d/10-aws.conflist ] || [ ! -x /opt/cni/bin/aws-cni ]; then
+  echo "CNI still not properly configured, running emergency fix..."
+  create_temp_cni_config
+  systemctl restart kubelet
+fi
 --==BOUNDARY==--
 USERDATA
 }
