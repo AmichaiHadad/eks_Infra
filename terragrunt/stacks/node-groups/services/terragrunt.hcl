@@ -106,6 +106,55 @@ inputs = {
   max_unavailable = null # Set this to null when using percentage instead
   max_unavailable_percentage = 50 # Allow 50% of nodes to be unavailable during updates
   
-  # Ensure terraform knows this depends on the VPC CNI addon
-  depends_on = ["null_resource.wait_for_cni"]
+  # Region for AWS calls
+  region = "us-east-1"
+  
+  # Ensure terraform knows this depends on both wait_for_cni and cleanup of self-managed nodes
+  depends_on = ["null_resource.wait_for_cni", "null_resource.cleanup_self_managed_nodes"]
+}
+
+# Add a cleanup step before node group creation to terminate any self-managed nodes
+generate "cleanup_self_managed" {
+  path = "cleanup_self_managed.tf"
+  if_exists = "overwrite"
+  contents = <<-EOF
+    # Find and terminate any self-managed nodes that should be in the managed node group
+    resource "null_resource" "cleanup_self_managed_nodes" {
+      # Always run this cleanup
+      triggers = {
+        always_run = "${timestamp()}"
+      }
+      
+      # Run AWS commands to find and terminate incorrectly joined nodes
+      provisioner "local-exec" {
+        command = <<-EOT
+          echo "Checking for self-managed nodes that should be in the managed node group..."
+          %{if substr(pathexpand("~"), 0, 1) == "/"}
+          NODE_IDS=$(aws ec2 describe-instances --filters "Name=tag:eks:cluster-name,Values=${dependency.eks.outputs.cluster_name}" "Name=tag:eks:nodegroup-name,Values=" "Name=instance-state-name,Values=running" --query "Reservations[].Instances[].InstanceId" --output text)
+          if [ -n "$NODE_IDS" ]; then
+            echo "Found self-managed nodes: $NODE_IDS - terminating..."
+            aws ec2 terminate-instances --instance-ids $NODE_IDS
+            echo "Waiting for instances to terminate..."
+            aws ec2 wait instance-terminated --instance-ids $NODE_IDS
+            echo "Self-managed nodes terminated"
+          else
+            echo "No self-managed nodes found"
+          fi
+          %{else}
+          FOR /F "tokens=*" %%g IN ('aws ec2 describe-instances --filters "Name=tag:eks:cluster-name,Values=${dependency.eks.outputs.cluster_name}" "Name=tag:eks:nodegroup-name,Values=" "Name=instance-state-name,Values=running" --query "Reservations[].Instances[].InstanceId" --output text') do (SET NODE_IDS=%%g)
+          IF NOT "%NODE_IDS%"=="" (
+            echo Found self-managed nodes: %NODE_IDS% - terminating...
+            aws ec2 terminate-instances --instance-ids %NODE_IDS%
+            echo Waiting for instances to terminate...
+            aws ec2 wait instance-terminated --instance-ids %NODE_IDS%
+            echo Self-managed nodes terminated
+          ) ELSE (
+            echo No self-managed nodes found
+          )
+          %{endif}
+        EOT
+        interpreter = ["%{if substr(pathexpand("~"), 0, 1) == "/"}bash%{else}cmd%{endif}", "-c"]
+      }
+    }
+  EOF
 } 

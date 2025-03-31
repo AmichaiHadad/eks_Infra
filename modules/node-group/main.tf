@@ -34,6 +34,10 @@ exec > /var/log/eks-bootstrap.log 2>&1
 
 echo "Starting bootstrap process for node group: ${var.node_group_name}, cluster: ${var.cluster_name}"
 
+# Set cluster identification
+echo "${var.cluster_name}" > /etc/eks-cluster-name
+echo "${local.final_node_group_name}" > /etc/eks-nodegroup-name
+
 # Create essential directories
 mkdir -p /etc/cni/net.d /opt/cni/bin /var/log/aws-routed-eni /var/run/aws-node
 
@@ -76,15 +80,15 @@ fi
 # Prepare kubelet with override to use CNI
 mkdir -p /etc/systemd/system/kubelet.service.d/
 echo '[Service]
-Environment="KUBELET_EXTRA_ARGS=--network-plugin=kubenet --cni-conf-dir=/etc/cni/net.d --cni-bin-dir=/opt/cni/bin"' > /etc/systemd/system/kubelet.service.d/10-cni-bootstrap.conf
+Environment="KUBELET_EXTRA_ARGS=--node-labels=eks.amazonaws.com/nodegroup=${local.final_node_group_name},eks.amazonaws.com/nodegroup-image=ami-custom-eks,node.kubernetes.io/node-group=${var.node_group_name},${local.node_labels_string} --max-pods=110 --register-with-taints= --network-plugin=kubenet --cni-conf-dir=/etc/cni/net.d --cni-bin-dir=/opt/cni/bin"' > /etc/systemd/system/kubelet.service.d/10-cni-bootstrap.conf
 systemctl daemon-reload
 
-# Bootstrap the node
+# Bootstrap with explicit EKS cluster and nodegroup flags
 /etc/eks/bootstrap.sh ${var.cluster_name} \
   --b64-cluster-ca ${var.cluster_certificate_authority_data} \
   --apiserver-endpoint ${var.cluster_endpoint} \
   --dns-cluster-ip 10.100.0.10 \
-  --kubelet-extra-args "--node-labels=node.kubernetes.io/node-group=${var.node_group_name},${local.node_labels_string} --max-pods=110"
+  --kubelet-extra-args "--node-labels=eks.amazonaws.com/nodegroup=${local.final_node_group_name},eks.amazonaws.com/capacityType=${var.capacity_type},eks.amazonaws.com/nodegroup-image=ami-custom-eks,node.kubernetes.io/node-group=${var.node_group_name},${local.node_labels_string} --max-pods=110"
 
 BOOTSTRAP_EXIT=$?
 echo "Bootstrap exit code: $BOOTSTRAP_EXIT"
@@ -99,8 +103,29 @@ echo "2. View kubelet logs:      journalctl -u kubelet"
 echo "3. Check kubelet status:   systemctl status kubelet"
 echo "4. Check CNI networks:     ls -la /etc/cni/net.d/ && cat /etc/cni/net.d/*"
 echo "5. Restart kubelet:        sudo systemctl restart kubelet"
+echo "6. Check node registration: kubectl get nodes --show-labels"
 EOF
 chmod +x /home/ec2-user/debug-eks.sh
+
+# Add fix-node-registration script
+cat > /home/ec2-user/fix-node-registration.sh << 'EOF'
+#!/bin/bash
+NODE_NAME=$(hostname)
+NODE_GROUP=$(cat /etc/eks-nodegroup-name)
+CLUSTER_NAME=$(cat /etc/eks-cluster-name)
+
+echo "Fixing node registration for $NODE_NAME in node group $NODE_GROUP"
+
+# Update kubelet with correct labels
+sudo sed -i "s|KUBELET_EXTRA_ARGS=.*|KUBELET_EXTRA_ARGS=--node-labels=eks.amazonaws.com/nodegroup=$NODE_GROUP,eks.amazonaws.com/capacityType=ON_DEMAND,node.kubernetes.io/node-group=${NODE_GROUP%-*} --max-pods=110|" /etc/systemd/system/kubelet.service.d/kubelet-extra-args.conf
+
+# Restart kubelet
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+
+echo "Node registration fix applied. Check status with kubectl get nodes"
+EOF
+chmod +x /home/ec2-user/fix-node-registration.sh
 
 # Clean up and restart kubelet
 rm -f /etc/systemd/system/kubelet.service.d/10-cni-bootstrap.conf
@@ -142,11 +167,38 @@ resource "aws_launch_template" "this" {
   # User data for bootstrap script with proper MIME format
   user_data = base64encode(local.user_data)
 
+  # Ensure all required EKS tags are included
   tag_specifications {
     resource_type = "instance"
     tags = merge(
       {
         Name = "${var.cluster_name}-${var.node_group_name}-node"
+        "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+        "eks:cluster-name" = var.cluster_name
+        "eks:nodegroup-name" = local.final_node_group_name
+      },
+      var.tags
+    )
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = merge(
+      {
+        Name = "${var.cluster_name}-${var.node_group_name}-volume"
+        "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+      },
+      var.tags
+    )
+  }
+
+  # Ensure the network interface is also tagged
+  tag_specifications {
+    resource_type = "network-interface"
+    tags = merge(
+      {
+        Name = "${var.cluster_name}-${var.node_group_name}-eni"
+        "kubernetes.io/cluster/${var.cluster_name}" = "owned"
       },
       var.tags
     )
@@ -272,6 +324,7 @@ resource "aws_eks_node_group" "this" {
   node_group_name = local.final_node_group_name
   node_role_arn   = aws_iam_role.node_group.arn
   subnet_ids      = var.subnet_ids
+  capacity_type   = var.capacity_type
 
   launch_template {
     id      = aws_launch_template.this.id
@@ -314,7 +367,16 @@ resource "aws_eks_node_group" "this" {
     aws_iam_role_policy_attachment.node_AmazonSSMManagedInstanceCore,
   ]
 
-  tags = var.tags
+  # Add resource tags to help with identification
+  tags = merge(
+    {
+      "Name" = "${var.cluster_name}-${var.node_group_name}"
+      "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+      "k8s.io/cluster-autoscaler/enabled" = "true"
+      "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
+    },
+    var.tags
+  )
 
   lifecycle {
     ignore_changes = [scaling_config[0].desired_size]
