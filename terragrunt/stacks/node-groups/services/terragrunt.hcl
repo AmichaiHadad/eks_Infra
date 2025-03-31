@@ -24,11 +24,14 @@ generate "sleep_after_addons" {
   path = "sleep_after_addons.tf"
   if_exists = "overwrite"
   contents = <<-EOF
+    # Wait resource that triggers after terragrunt processes the dependency
     resource "null_resource" "wait_for_cni" {
+      # Generate a new id each time to force this to run
       triggers = {
-        vpc_cni_addon_id = dependency.eks_addons.outputs.vpc_cni_addon_id
+        always_run = "${timestamp()}"
       }
       
+      # Simple sleep to ensure VPC CNI has time to initialize
       provisioner "local-exec" {
         command = "echo 'Waiting for VPC CNI to initialize...' && sleep 120"
       }
