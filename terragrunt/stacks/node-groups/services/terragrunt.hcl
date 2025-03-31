@@ -31,9 +31,17 @@ generate "sleep_after_addons" {
         always_run = "${timestamp()}"
       }
       
-      # Simple sleep to ensure VPC CNI has time to initialize
+      # Cross-platform sleep command (works on both Windows and Linux)
       provisioner "local-exec" {
-        command = "echo 'Waiting for VPC CNI to initialize...' && sleep 120"
+        command = <<-EOT
+          echo "Waiting for VPC CNI to initialize..."
+          %{if substr(pathexpand("~"), 0, 1) == "/"}
+          sleep 120
+          %{else}
+          ping -n 121 127.0.0.1 > nul
+          %{endif}
+        EOT
+        interpreter = ["%{if substr(pathexpand("~"), 0, 1) == "/"}bash%{else}cmd%{endif}", "-c"]
       }
     }
   EOF

@@ -19,7 +19,7 @@ locals {
   # Final node group name that's guaranteed to be under 60 chars
   final_node_group_name = "${local.truncated_node_group_name}-${random_id.node_group.hex}"
   
-  # Properly format user data with MIME multipart
+  # Smaller, simplified user data to stay under AWS limit of 16384 bytes
   user_data = <<-USERDATA
 MIME-Version: 1.0
 Content-Type: multipart/mixed; boundary="==BOUNDARY=="
@@ -28,76 +28,17 @@ Content-Type: multipart/mixed; boundary="==BOUNDARY=="
 Content-Type: text/x-shellscript; charset="us-ascii"
 
 #!/bin/bash
-# EKS Node bootstrap script with enhanced CNI handling and diagnostics
-# ==========================================================================
-
-# Enable maximum debugging
+# Simplified EKS Node bootstrap script with critical CNI handling
 set -x
-exec > >(tee /var/log/eks-bootstrap.log) 2>&1
+exec > /var/log/eks-bootstrap.log 2>&1
 
-echo "======== EKS Node Bootstrap Diagnostic Script ========"
-echo "Starting bootstrap process at $$(date)"
-echo "Node Group: ${var.node_group_name}"
-echo "Cluster: ${var.cluster_name}"
+echo "Starting bootstrap process for node group: ${var.node_group_name}, cluster: ${var.cluster_name}"
 
-# Create debugging directory
-mkdir -p /var/log/eks-debug
+# Create essential directories
+mkdir -p /etc/cni/net.d /opt/cni/bin /var/log/aws-routed-eni /var/run/aws-node
 
-# Install required utilities
-yum install -y jq curl aws-cli bind-utils
-
-# Save critical information to debug files
-echo "${var.cluster_name}" > /var/log/eks-debug/cluster-name.txt
-echo "${var.cluster_endpoint}" > /var/log/eks-debug/cluster-endpoint.txt
-echo "${var.cluster_certificate_authority_data}" | base64 -d > /var/log/eks-debug/cluster-ca.pem
-
-# Check EC2 metadata service and instance identity
-echo "Testing EC2 metadata service..."
-TOKEN=$$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document > /var/log/eks-debug/instance-identity.json
-INSTANCE_ID=$$(jq -r .instanceId /var/log/eks-debug/instance-identity.json)
-REGION=$$(jq -r .region /var/log/eks-debug/instance-identity.json)
-AVAILABILITY_ZONE=$$(jq -r .availabilityZone /var/log/eks-debug/instance-identity.json)
-echo "Instance ID: $$INSTANCE_ID"
-echo "Region: $$REGION"
-echo "Availability Zone: $$AVAILABILITY_ZONE"
-
-# Pre-create CNI directories to avoid race conditions
-mkdir -p /etc/cni/net.d
-mkdir -p /opt/cni/bin
-mkdir -p /var/log/aws-routed-eni
-mkdir -p /var/run/aws-node
-
-# Function to check VPC CNI status with retries
-check_vpc_cni_status() {
-  local retries=10
-  local wait_time=10
-  local attempt=1
-  local status="UNKNOWN"
-
-  echo "Checking VPC CNI addon status from AWS API..."
-  
-  while [ $$attempt -le $$retries ]; do
-    echo "Attempt $$attempt of $$retries to check VPC CNI status..."
-    status=$(aws eks describe-addon --cluster-name ${var.cluster_name} --addon-name vpc-cni --region $$REGION --query 'addon.status' --output text 2>/dev/null || echo "UNKNOWN")
-    echo "VPC CNI addon status: $$status"
-    
-    if [ "$$status" = "ACTIVE" ]; then
-      return 0
-    fi
-    
-    echo "Waiting $$wait_time seconds before next attempt..."
-    sleep $$wait_time
-    attempt=$((attempt+1))
-  done
-  
-  return 1
-}
-
-# Download and create temporary CNI configuration if needed
-create_temp_cni_config() {
-  echo "Creating temporary CNI configuration to bootstrap networking..."
-  cat > /etc/cni/net.d/10-aws.conflist << 'EOF'
+# Create a temporary CNI config if needed
+cat > /etc/cni/net.d/10-aws.conflist << 'EOF'
 {
   "cniVersion": "0.4.0",
   "name": "aws-cni",
@@ -119,259 +60,54 @@ create_temp_cni_config() {
 }
 EOF
 
-  # Create placeholder binaries if needed
-  if [ ! -f "/opt/cni/bin/aws-cni" ]; then
-    echo "Creating placeholder CNI binaries..."
-    cat > /opt/cni/bin/aws-cni << 'EOF'
-#!/bin/sh
+# Create placeholder CNI binaries if needed
+if [ ! -f "/opt/cni/bin/aws-cni" ]; then
+  echo '#!/bin/sh
 echo "Placeholder aws-cni binary"
-exit 0
-EOF
-
-    cat > /opt/cni/bin/egress-cni << 'EOF'
-#!/bin/sh
+exit 0' > /opt/cni/bin/aws-cni
+  chmod +x /opt/cni/bin/aws-cni
+  
+  echo '#!/bin/sh
 echo "Placeholder egress-cni binary"
-exit 0
-EOF
-
-    chmod +x /opt/cni/bin/aws-cni
-    chmod +x /opt/cni/bin/egress-cni
-  fi
-}
-
-# Function to wait for CNI configuration with enhanced retries
-wait_for_cni_config() {
-  local retries=30
-  local wait_time=10
-  local attempt=1
-  
-  echo "Waiting for CNI configuration to be available..."
-  
-  while [ $$attempt -le $$retries ]; do
-    echo "Attempt $$attempt of $$retries to check for CNI configuration..."
-    
-    if [ -d /etc/cni/net.d ] && [ -n "$(ls -A /etc/cni/net.d 2>/dev/null)" ]; then
-      echo "CNI configuration found:"
-      ls -la /etc/cni/net.d
-      cat /etc/cni/net.d/*
-      return 0
-    fi
-    
-    echo "CNI configuration not found, waiting $$wait_time seconds..."
-    sleep $$wait_time
-    attempt=$((attempt+1))
-  done
-  
-  echo "CNI configuration not found after $$retries attempts. Creating temporary configuration..."
-  create_temp_cni_config
-  return 1
-}
-
-# Function to manually download and install AWS CNI if needed
-install_aws_cni() {
-  echo "Manually downloading and installing AWS CNI..."
-  
-  # Create temp directory
-  mkdir -p /tmp/aws-cni
-  cd /tmp/aws-cni
-  
-  # Download latest AWS CNI
-  curl -Lo aws-k8s-cni.yaml https://raw.githubusercontent.com/aws/amazon-vpc-cni-k8s/master/config/master/aws-k8s-cni.yaml
-  
-  # Extract binary locations from the YAML
-  CNI_IMAGE=$(grep -A 2 "image:" aws-k8s-cni.yaml | grep "amazon-k8s-cni" | head -1 | awk '{print $2}')
-  
-  if [ -n "$$CNI_IMAGE" ]; then
-    echo "Found CNI image: $$CNI_IMAGE"
-    
-    # Pull the image
-    docker pull $$CNI_IMAGE || echo "Could not pull CNI image"
-    
-    # Extract binaries from image if docker is available
-    if command -v docker > /dev/null; then
-      echo "Extracting CNI binaries from docker image..."
-      docker create --name aws-cni-temp $$CNI_IMAGE
-      docker cp aws-cni-temp:/app/aws-cni /opt/cni/bin/
-      docker cp aws-cni-temp:/app/egress-cni /opt/cni/bin/
-      docker rm aws-cni-temp
-      chmod +x /opt/cni/bin/aws-cni
-      chmod +x /opt/cni/bin/egress-cni
-    fi
-  else
-    echo "Could not find CNI image in yaml file"
-  fi
-}
-
-# Check VPC CNI status and create temporary config if not active
-if ! check_vpc_cni_status; then
-  echo "VPC CNI addon not active or not reachable, creating temporary CNI setup..."
-  create_temp_cni_config
-  install_aws_cni
+exit 0' > /opt/cni/bin/egress-cni
+  chmod +x /opt/cni/bin/egress-cni
 fi
 
-# Wait for proper CNI configuration
-wait_for_cni_config
-
-# Run network diagnostics
-echo "Testing network connectivity..."
-
-# Test DNS resolution
-echo "Testing DNS resolution..."
-echo "CoreDNS service default IP (10.100.0.10):"
-dig +short 10.100.0.10 || echo "DNS lookup for 10.100.0.10 failed"
-
-# Test API server connectivity
-echo "API Server connectivity:"
-API_SERVER="$${var.cluster_endpoint#https://}"
-echo "API server DNS lookup result:"
-dig +short $$API_SERVER || echo "DNS lookup for $$API_SERVER failed"
-
-echo "Testing HTTPS connectivity to API server..."
-curl -k --connect-timeout 10 ${var.cluster_endpoint}/healthz || echo "Connection to API server failed"
-
-# EKS service CIDR detection
-# Most EKS clusters use 10.100.0.0/16 by default, but we'll check both common options
-echo "Trying to detect correct EKS service CIDR..."
-for SERVICE_CIDR in "10.100.0.0/16" "172.20.0.0/16"; do
-  DNS_IP="$${SERVICE_CIDR%.*.*}.0.10"
-  echo "Testing DNS_IP=$$DNS_IP (from $$SERVICE_CIDR)"
-  echo $$DNS_IP > /var/log/eks-debug/dns-ip-$$DNS_IP.txt
-done
-
-# Default to 10.100.0.10 for DNS service IP
-DNS_CLUSTER_IP="10.100.0.10"
-echo "Using DNS_CLUSTER_IP=$$DNS_CLUSTER_IP for bootstrap"
-
-# Get VPC CIDR information
-echo "VPC networking information:"
-ip addr show
-ip route show
-
-# Check kubelet version
-echo "Checking kubelet version:"
-kubelet --version || echo "Kubelet not available yet"
-
-# Prepare bootstrap kubelet config to avoid CNI dependency during bootstrap
-echo "Creating temporary kubelet systemd drop-in to avoid CNI issues..."
+# Prepare kubelet with override to use CNI
 mkdir -p /etc/systemd/system/kubelet.service.d/
-cat > /etc/systemd/system/kubelet.service.d/10-pre-cni-bootstrap.conf << 'EOF'
-[Service]
-Environment="KUBELET_EXTRA_ARGS=--network-plugin=kubenet --cni-conf-dir=/etc/cni/net.d --cni-bin-dir=/opt/cni/bin"
-EOF
-
-# Reload systemd to apply the drop-in
+echo '[Service]
+Environment="KUBELET_EXTRA_ARGS=--network-plugin=kubenet --cni-conf-dir=/etc/cni/net.d --cni-bin-dir=/opt/cni/bin"' > /etc/systemd/system/kubelet.service.d/10-cni-bootstrap.conf
 systemctl daemon-reload
 
-# Try to run the bootstrap script
-echo "==== Running EKS bootstrap script ===="
-echo "Bootstrap command: /etc/eks/bootstrap.sh ${var.cluster_name} --b64-cluster-ca ${var.cluster_certificate_authority_data} --apiserver-endpoint ${var.cluster_endpoint} --dns-cluster-ip $$DNS_CLUSTER_IP --kubelet-extra-args '--node-labels=node.kubernetes.io/node-group=${var.node_group_name},${local.node_labels_string} --max-pods=110'"
-
-# Run bootstrap with timeout to avoid hanging indefinitely
-timeout 300 /etc/eks/bootstrap.sh ${var.cluster_name} \
+# Bootstrap the node
+/etc/eks/bootstrap.sh ${var.cluster_name} \
   --b64-cluster-ca ${var.cluster_certificate_authority_data} \
   --apiserver-endpoint ${var.cluster_endpoint} \
-  --dns-cluster-ip $$DNS_CLUSTER_IP \
-  --kubelet-extra-args '--node-labels=node.kubernetes.io/node-group=${var.node_group_name},${local.node_labels_string} --max-pods=110'
+  --dns-cluster-ip 10.100.0.10 \
+  --kubelet-extra-args "--node-labels=node.kubernetes.io/node-group=${var.node_group_name},${local.node_labels_string} --max-pods=110"
 
-BOOTSTRAP_EXIT_CODE=$$?
-echo "Bootstrap script exit code: $$BOOTSTRAP_EXIT_CODE"
+BOOTSTRAP_EXIT=$?
+echo "Bootstrap exit code: $BOOTSTRAP_EXIT"
 
-# Save kubelet configuration and logs regardless of bootstrap success
-echo "==== Kubelet Configuration and Logs ===="
-mkdir -p /var/log/eks-debug/kubelet
-cp -r /var/lib/kubelet/* /var/log/eks-debug/kubelet/ 2>/dev/null || echo "Couldn't copy kubelet config"
-
-# Gather logs
-echo "==== Saving system logs ===="
-journalctl -u kubelet -n 200 > /var/log/eks-debug/kubelet-journal.log 2>/dev/null || echo "No kubelet journal logs yet"
-dmesg > /var/log/eks-debug/dmesg.log
-cp /var/log/messages /var/log/eks-debug/messages.log 2>/dev/null || echo "No messages log file"
-cp /var/log/cloud-init* /var/log/eks-debug/ 2>/dev/null || echo "No cloud-init logs"
-
-# Remove the temporary kubelet config now that bootstrap is complete
-echo "Removing temporary kubelet overrides..."
-rm -f /etc/systemd/system/kubelet.service.d/10-pre-cni-bootstrap.conf
-systemctl daemon-reload
-
-# Check if kubelet is running - start it if not
-if ! systemctl is-active kubelet; then
-  echo "Kubelet not running, attempting to start it..."
-  systemctl start kubelet
-  sleep 5
-  systemctl status kubelet > /var/log/eks-debug/kubelet-status.log 2>&1 || echo "Kubelet status check failed"
-fi
-
-# Create fix-cni script to help with troubleshooting
-cat > /home/ec2-user/fix-cni.sh << 'EOF'
-#!/bin/bash
-set -x
-
-echo "Checking AWS VPC CNI addon status..."
-aws eks describe-addon --cluster-name $(cat /var/log/eks-debug/cluster-name.txt) --addon-name vpc-cni --region $(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
-
-echo "Checking CNI pods..."
-kubectl get pods -n kube-system -l k8s-app=aws-node
-
-echo "Showing CNI configuration..."
-ls -la /etc/cni/net.d/
-cat /etc/cni/net.d/*
-
-echo "Restarting kubelet..."
-systemctl restart kubelet
-
-echo "Checking CNI logs..."
-kubectl logs -n kube-system -l k8s-app=aws-node --tail=20
-
-echo "CNI fix completed"
-EOF
-chmod +x /home/ec2-user/fix-cni.sh
-
-# Create a file with debugging commands for easier troubleshooting via SSM
+# Create a helper script for debugging
 cat > /home/ec2-user/debug-eks.sh << 'EOF'
 #!/bin/bash
 echo "EKS Node Debug Helper"
 echo "===================="
-echo "1. View bootstrap logs:              cat /var/log/eks-bootstrap.log"
-echo "2. View kubelet logs:                journalctl -u kubelet"
-echo "3. Check kubelet status:             systemctl status kubelet"
-echo "4. View kubelet config:              ls -la /var/lib/kubelet"
-echo "5. View system logs:                 tail -100 /var/log/messages"
-echo "6. Test API connectivity:            curl -k \$(cat /var/log/eks-debug/cluster-endpoint.txt)/healthz"
-echo "7. View instance identity:           cat /var/log/eks-debug/instance-identity.json"
-echo "8. View all debug logs:              ls -la /var/log/eks-debug/"
-echo "9. Check CNI networks:               ls -la /etc/cni/net.d/ && cat /etc/cni/net.d/*"
-echo "10. Check certificates:              ls -la /etc/kubernetes/pki/"
-echo ""
-echo "11. Check AWS VPC CNI addon status:  aws eks describe-addon --cluster-name \$(cat /var/log/eks-debug/cluster-name.txt) --addon-name vpc-cni --region \$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)"
-echo "12. Check node logs in AWS CNI:      kubectl logs -n kube-system -l k8s-app=aws-node --tail=50"
-echo "13. Restart kubelet:                 sudo systemctl restart kubelet"
-echo "14. Fix CNI issues:                  sudo /home/ec2-user/fix-cni.sh"
-echo ""
+echo "1. View bootstrap logs:    cat /var/log/eks-bootstrap.log"
+echo "2. View kubelet logs:      journalctl -u kubelet"
+echo "3. Check kubelet status:   systemctl status kubelet"
+echo "4. Check CNI networks:     ls -la /etc/cni/net.d/ && cat /etc/cni/net.d/*"
+echo "5. Restart kubelet:        sudo systemctl restart kubelet"
 EOF
 chmod +x /home/ec2-user/debug-eks.sh
 
-# Ensure permissions are set for SSM access
-chmod -R 755 /var/log/eks-debug
-chmod 644 /var/log/eks-bootstrap.log
+# Clean up and restart kubelet
+rm -f /etc/systemd/system/kubelet.service.d/10-cni-bootstrap.conf
+systemctl daemon-reload
+systemctl restart kubelet
 
-echo "=========== Bootstrap process completed ==========="
-echo "Debug logs available at /var/log/eks-bootstrap.log and /var/log/eks-debug/"
-echo "Run /home/ec2-user/debug-eks.sh for troubleshooting help"
-echo "Run /home/ec2-user/fix-cni.sh to fix CNI issues"
-
-# Keep kubelet running even if bootstrap failed
-if [ $$BOOTSTRAP_EXIT_CODE -ne 0 ]; then
-  echo "Bootstrap failed, but keeping kubelet running for debugging"
-  systemctl restart kubelet
-fi
-
-# Final check to ensure the node is properly configured for CNI
-echo "Performing final CNI check..."
-if [ ! -f /etc/cni/net.d/10-aws.conflist ] || [ ! -x /opt/cni/bin/aws-cni ]; then
-  echo "CNI still not properly configured, running emergency fix..."
-  create_temp_cni_config
-  systemctl restart kubelet
-fi
+echo "Bootstrap process completed"
 --==BOUNDARY==--
 USERDATA
 }
