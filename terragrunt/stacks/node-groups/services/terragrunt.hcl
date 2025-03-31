@@ -41,18 +41,7 @@ generate "sleep_after_addons" {
 generate "empty_required_providers" {
   path      = "required_providers.tf"
   if_exists = "overwrite_terragrunt"
-  contents  = <<-EOF
-    # This file intentionally left empty to prevent conflicts with the module's versions.tf
-    
-    terraform {
-      required_providers {
-        null = {
-          source  = "hashicorp/null"
-          version = "~> 3.0"
-        }
-      }
-    }
-  EOF
+  contents  = "# This file intentionally left empty to prevent conflicts with the module's versions.tf"
 }
 
 terraform {
