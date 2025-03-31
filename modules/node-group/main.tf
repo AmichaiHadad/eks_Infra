@@ -107,17 +107,27 @@ echo "6. Check node registration: kubectl get nodes --show-labels"
 EOF
 chmod +x /home/ec2-user/debug-eks.sh
 
-# Add fix-node-registration script
+# Create a simplified fix-node-registration script without parameter expansion
 cat > /home/ec2-user/fix-node-registration.sh << 'EOF'
 #!/bin/bash
+# Simple script to fix node registration with EKS managed node groups
+
+# Get node information
 NODE_NAME=$(hostname)
 NODE_GROUP=$(cat /etc/eks-nodegroup-name)
 CLUSTER_NAME=$(cat /etc/eks-cluster-name)
 
 echo "Fixing node registration for $NODE_NAME in node group $NODE_GROUP"
 
-# Update kubelet with correct labels
-sudo sed -i "s|KUBELET_EXTRA_ARGS=.*|KUBELET_EXTRA_ARGS=--node-labels=eks.amazonaws.com/nodegroup=$NODE_GROUP,eks.amazonaws.com/capacityType=ON_DEMAND,node.kubernetes.io/node-group=${NODE_GROUP%-*} --max-pods=110|" /etc/systemd/system/kubelet.service.d/kubelet-extra-args.conf
+# Create a new kubelet config file with the proper labels
+cat > /tmp/kubelet-extra-args.conf << INNEREOF
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--node-labels=eks.amazonaws.com/nodegroup=$NODE_GROUP,eks.amazonaws.com/capacityType=ON_DEMAND,node.kubernetes.io/node-group=$NODE_GROUP --max-pods=110"
+INNEREOF
+
+# Install the new config
+sudo mv /tmp/kubelet-extra-args.conf /etc/systemd/system/kubelet.service.d/kubelet-extra-args.conf
+sudo chmod 644 /etc/systemd/system/kubelet.service.d/kubelet-extra-args.conf
 
 # Restart kubelet
 sudo systemctl daemon-reload
